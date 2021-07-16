@@ -69,7 +69,7 @@ func setDefaultPluginConfig(th *TestHelper, pluginID string) {
 	})
 }
 
-func setupMultiPluginApiTest(t *testing.T, pluginCodes []string, pluginManifests []string, pluginIDs []string, app *App, c *request.Context) string {
+func setupMultiPluginApiTest(t *testing.T, pluginCodes []string, pluginManifests []string, pluginIDs []string, asMain bool, app *App, c *request.Context) string {
 	pluginDir, err := ioutil.TempDir("", "")
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -92,7 +92,7 @@ func setupMultiPluginApiTest(t *testing.T, pluginCodes []string, pluginManifests
 		return app.NewPluginAPI(c, manifest)
 	}
 
-	env, err := plugin.NewEnvironment(newPluginAPI, pluginDir, webappPluginDir, app.Log(), nil)
+	env, err := plugin.NewEnvironment(newPluginAPI, NewDriverImpl(app.srv), pluginDir, webappPluginDir, app.Log(), nil)
 	require.NoError(t, err)
 
 	require.Equal(t, len(pluginCodes), len(pluginIDs))
@@ -100,7 +100,11 @@ func setupMultiPluginApiTest(t *testing.T, pluginCodes []string, pluginManifests
 
 	for i, pluginID := range pluginIDs {
 		backend := filepath.Join(pluginDir, pluginID, "backend.exe")
-		utils.CompileGo(t, pluginCodes[i], backend)
+		if asMain {
+			utils.CompileGo(t, pluginCodes[i], backend)
+		} else {
+			utils.CompileGoTest(t, pluginCodes[i], backend)
+		}
 
 		ioutil.WriteFile(filepath.Join(pluginDir, pluginID, "plugin.json"), []byte(pluginManifests[i]), 0600)
 		manifest, activated, reterr := env.Activate(pluginID)
@@ -121,7 +125,11 @@ func setupMultiPluginApiTest(t *testing.T, pluginCodes []string, pluginManifests
 }
 
 func setupPluginApiTest(t *testing.T, pluginCode string, pluginManifest string, pluginID string, app *App, c *request.Context) string {
-	return setupMultiPluginApiTest(t, []string{pluginCode}, []string{pluginManifest}, []string{pluginID}, app, c)
+
+	asMain := pluginID != "test_db_driver"
+	return setupMultiPluginApiTest(t,
+		[]string{pluginCode}, []string{pluginManifest}, []string{pluginID},
+		asMain, app, c)
 }
 
 func TestPublicFilesPathConfiguration(t *testing.T) {
@@ -766,7 +774,7 @@ func TestPluginAPIGetPlugins(t *testing.T) {
 	defer os.RemoveAll(pluginDir)
 	defer os.RemoveAll(webappPluginDir)
 
-	env, err := plugin.NewEnvironment(th.NewPluginAPI, pluginDir, webappPluginDir, th.App.Log(), nil)
+	env, err := plugin.NewEnvironment(th.NewPluginAPI, NewDriverImpl(th.Server), pluginDir, webappPluginDir, th.App.Log(), nil)
 	require.NoError(t, err)
 
 	pluginIDs := []string{"pluginid1", "pluginid2", "pluginid3"}
@@ -854,7 +862,7 @@ func TestInstallPlugin(t *testing.T) {
 			return app.NewPluginAPI(c, manifest)
 		}
 
-		env, err := plugin.NewEnvironment(newPluginAPI, pluginDir, webappPluginDir, app.Log(), nil)
+		env, err := plugin.NewEnvironment(newPluginAPI, NewDriverImpl(app.srv), pluginDir, webappPluginDir, app.Log(), nil)
 		require.NoError(t, err)
 
 		app.SetPluginsEnvironment(env)
@@ -1053,6 +1061,7 @@ func pluginAPIHookTest(t *testing.T, th *TestHelper, fileName string, id string,
 	if settingsSchema != "" {
 		schema = settingsSchema
 	}
+	th.App.srv.sqlStore = th.GetSqlStore()
 	setupPluginApiTest(t, code,
 		fmt.Sprintf(`{"id": "%v", "backend": {"executable": "backend.exe"}, "settings_schema": %v}`, id, schema),
 		id, th.App, th.Context)
@@ -1405,23 +1414,27 @@ func TestInterpluginPluginHTTP(t *testing.T) {
 		}
 
 		func (p *MyPlugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/api/v2/test" {
-				return
-			}
+			switch r.URL.Path {
+			case "/api/v2/test":
+				if r.URL.Query().Get("abc") != "xyz" {
+					return
+				}
 
-			if r.URL.Query().Get("abc") != "xyz" {
-				return
-			}
+				if r.Header.Get("Mattermost-Plugin-ID") != "testplugininterclient" {
+					return
+				}
 
-			if r.Header.Get("Mattermost-Plugin-ID") != "testplugininterclient" {
-				return
+				buf := bytes.Buffer{}
+				buf.ReadFrom(r.Body)
+				resp := "we got:" + buf.String()
+				w.WriteHeader(598)
+				w.Write([]byte(resp))
+				if r.URL.Path != "/api/v2/test" {
+					return
+				}
+			case "/nobody":
+				w.WriteHeader(599)
 			}
-
-			buf := bytes.Buffer{}
-			buf.ReadFrom(r.Body)
-			resp := "we got:" + buf.String()
-			w.WriteHeader(598)
-			w.Write([]byte(resp))
 		}
 
 		func main() {
@@ -1465,7 +1478,26 @@ func TestInterpluginPluginHTTP(t *testing.T) {
 			if resp.StatusCode != 598 {
 				return nil, "wrong status " + string(respbody)
 			}
-			return nil, string(respbody)
+
+			if string(respbody) !=  "we got:This is the request" {
+				return nil, "wrong response " + string(respbody)
+			}
+
+			req, err = http.NewRequest("GET", "/testplugininterserver/nobody", nil)
+			if err != nil {
+				return nil, err.Error()
+			}
+
+			resp = p.API.PluginHTTP(req)
+			if resp == nil {
+				return nil, "Nil resp"
+			}
+
+			if resp.StatusCode != 599 {
+				return nil, "wrong status " + string(respbody)
+			}
+
+			return nil, "ok"
 		}
 
 		func main() {
@@ -1481,6 +1513,7 @@ func TestInterpluginPluginHTTP(t *testing.T) {
 			"testplugininterserver",
 			"testplugininterclient",
 		},
+		true,
 		th.App,
 		th.Context,
 	)
@@ -1488,7 +1521,7 @@ func TestInterpluginPluginHTTP(t *testing.T) {
 	hooks, err := th.App.GetPluginsEnvironment().HooksForPlugin("testplugininterclient")
 	require.NoError(t, err)
 	_, ret := hooks.MessageWillBePosted(nil, nil)
-	assert.Equal(t, "we got:This is the request", ret)
+	assert.Equal(t, "ok", ret)
 }
 
 func TestApiMetrics(t *testing.T) {
@@ -1505,7 +1538,7 @@ func TestApiMetrics(t *testing.T) {
 		defer os.RemoveAll(pluginDir)
 		defer os.RemoveAll(webappPluginDir)
 
-		env, err := plugin.NewEnvironment(th.NewPluginAPI, pluginDir, webappPluginDir, th.App.Log(), metricsMock)
+		env, err := plugin.NewEnvironment(th.NewPluginAPI, NewDriverImpl(th.Server), pluginDir, webappPluginDir, th.App.Log(), metricsMock)
 		require.NoError(t, err)
 
 		th.App.SetPluginsEnvironment(env)
